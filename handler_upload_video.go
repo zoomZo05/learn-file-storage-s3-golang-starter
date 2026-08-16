@@ -1,13 +1,17 @@
 package main
 
 import (
+	"bytes"
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -102,13 +106,30 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	//Determine the aspect ratio from the saved temporary file
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Failed to determine video aspect ratio", err)
+		return
+	}
+
+	var prefix string
+	switch aspectRatio {
+	case "16:9":
+		prefix = "landscape"
+	case "9:16":
+		prefix = "portrait"
+	default:
+		prefix = "other"
+	}
+
 	randomBytes := make([]byte, 32)
 	if _, err := rand.Read(randomBytes); err != nil {
 		respondWithError(w, http.StatusInternalServerError, "Failed to generate random key", err)
 		return
 	}
 
-	key := fmt.Sprintf("%s%s", hex.EncodeToString(randomBytes), ext)
+	key := fmt.Sprintf("%s/%s%s", prefix, hex.EncodeToString(randomBytes), ext)
 
 	_, err = cfg.s3Client.PutObject(r.Context(), &s3.PutObjectInput{
 		Bucket:      aws.String(cfg.s3Bucket),
@@ -133,4 +154,55 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	}
 
 	respondWithJSON(w, http.StatusOK, videoDb)
+}
+
+type probeWidthHeight struct {
+	Streams []struct {
+		Width  int `json:"width"`
+		Height int `json:"height"`
+	} `json:"streams"`
+}
+
+func getVideoAspectRatio(filePath string) (string, error) {
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+
+	var buf bytes.Buffer
+	cmd.Stdout = &buf
+
+	if err := cmd.Run(); err != nil {
+		return "", err
+	}
+
+	var data probeWidthHeight
+	if err := json.Unmarshal(buf.Bytes(), &data); err != nil {
+		return "", err
+	}
+
+	var width, height int
+	for _, s := range data.Streams {
+		if s.Width > 0 && s.Height > 0 {
+			width = s.Width
+			height = s.Height
+			break
+		}
+	}
+
+	if width == 0 || height == 0 {
+		return "", fmt.Errorf("no video stream found with valid dimensions")
+	}
+
+	ratio := float64(width) / float64(height)
+
+	const target16x9 = 16.0 / 9.0 // ~1.7778
+	const target9x16 = 9.0 / 16.0 // 0.5625
+	const tolerance = 0.02
+
+	if math.Abs(ratio-target16x9) <= tolerance {
+		return "16:9", nil
+	}
+	if math.Abs(ratio-target9x16) <= tolerance {
+		return "9:16", nil
+	}
+
+	return "other", nil
 }
